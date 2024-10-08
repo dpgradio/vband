@@ -14,7 +14,7 @@ import (
 )
 
 var (
-	config_file = flag.String("c", "", "YML config file")
+	config_file = flag.String("c", "./config.yaml", "YML config file")
 	config      Config
 )
 

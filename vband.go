@@ -4,40 +4,72 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"github.com/kreuzwerker/gva"
-	"github.com/redis/go-redis/v9"
-	"github.com/spf13/viper"
 	"log"
 	"os"
-	"strings"
+	"sync"
 	"time"
-)
 
-var (
-	config_file = flag.String("c", "./config.yaml", "YML config file")
-	config      Config
+	"github.com/kreuzwerker/gva"
+	"github.com/redis/go-redis/v9"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
 )
 
 type Config struct {
-	LogFile        string           `mapstructure:"log_file"`
-	RedisUrl       string           `mapstructure:"redis_url"`
-	RedisSentinels []string         `mapstructure:"redis_sentinels"`
-	VarnishServers []*VarnishServer `mapstructure:"varnish_servers"`
+	LogFile     string
+	RedisUrl    string
+	ServiceName string
+	Namespace   string
+	Port        uint64
 }
 
 type VarnishServer struct {
-	Host   string `mapstructure:"host"`
-	Port   uint16 `mapstructure:"port"`
-	Secret string `mapstructure:"secret"`
-
-	Test   string
+	Host   string
+	Port   uint16
+	Secret string
 	In     chan string
 	socket *gva.Connection
 }
 
+var (
+	config         Config
+	redisClient    *redis.Client
+	varnishServers map[string]*VarnishServer
+	serverLock     sync.RWMutex
+)
+
+func parseFlags() Config {
+	var config Config
+
+	flag.StringVar(&config.LogFile, "log_file", "", "Path to log file (default: stdout)")
+	flag.StringVar(&config.RedisUrl, "redis_url", "", "URL for Redis server (e.g., redis://localhost:6379/0)")
+	flag.StringVar(&config.ServiceName, "varnish_service", "", "Kubernetes Service name for Varnish endpoints")
+	flag.StringVar(&config.Namespace, "namespace", "default", "Kubernetes namespace for Varnish service (default: default)")
+	flag.Uint64Var(&config.Port, "varnish_port", 6082, "Varnish port")
+
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
+		flag.PrintDefaults()
+	}
+
+	flag.Parse()
+
+	// Validate required flags
+	if config.RedisUrl == "" || config.ServiceName == "" {
+		flag.Usage()
+		log.Fatal("Error: redis_url and varnish_service are required parameters.")
+	} else {
+		log.Printf("Starting with config:` %o", config)
+	}
+
+	return config
+}
+
 func (v *VarnishServer) Start() {
 	v.In = make(chan string, 1024)
-
 	for {
 		err := v.StartOne()
 		if err != nil {
@@ -49,7 +81,8 @@ func (v *VarnishServer) Start() {
 	}
 }
 
-func (v *VarnishServer) StartOne() (err error) {
+func (v *VarnishServer) StartOne() error {
+	var err error
 	v.socket, err = v.connect()
 	if err != nil {
 		return err
@@ -57,63 +90,57 @@ func (v *VarnishServer) StartOne() (err error) {
 
 	for {
 		cmd := <-v.In
-		response, e := v.socket.Cmd(cmd)
-		if e != nil {
-			log.Printf("cmd=\"%s\" status= err=%v\n", cmd, e)
+		response, err := v.socket.Cmd(cmd)
+		if err != nil {
+			log.Printf("cmd=\"%s\" status= err=%v\n", cmd, err)
 			v.In <- cmd
-			return e
+			return err
 		}
 
 		log.Printf("cmd=\"%s\" status=%d body=\"%s\" err=\n", cmd, response.Status, response.Body)
 	}
 }
 
-func (v *VarnishServer) connect() (socket *gva.Connection, err error) {
-	socket, err = gva.NewConnection(v.Host, v.Port, &v.Secret)
+func (v *VarnishServer) connect() (*gva.Connection, error) {
+	socket, err := gva.NewConnection(v.Host, v.Port, &v.Secret)
 	if err != nil {
-		return
+		return nil, err
 	}
 	socket.Keepalive(1 * time.Second)
-
-	return
+	return socket, nil
 }
 
 func newRedisClient(c Config) *redis.Client {
-	opts, e := redis.ParseURL(c.RedisUrl)
-	if e != nil {
-		panic(e)
+	opts, err := redis.ParseURL(c.RedisUrl)
+	if err != nil {
+		panic(err)
 	}
 
-	if len(c.RedisSentinels) > 0 {
-		// Get the hostname from host:port
-		masterName := strings.Split(opts.Addr, ":")[0]
-
-		return redis.NewFailoverClient(&redis.FailoverOptions{
-			MasterName:    masterName,
-			SentinelAddrs: c.RedisSentinels,
-			DB:            opts.DB,
-		})
-	} else {
-		return redis.NewClient(opts)
-	}
+	return redis.NewClient(opts)
 }
 
-func redisListenLoop(queue string, servers []*VarnishServer) (err error) {
+func redisListenLoop(queue string) error {
 	rdb := newRedisClient(config)
 	ctx := context.Background()
 
 	for {
-		data, e := rdb.BLPop(ctx, 0, "queue:go:"+queue).Result()
-		if e != nil {
-			return e
+		data, err := rdb.BLPop(ctx, 0, "queue:go:"+queue).Result()
+		if err != nil {
+			return err
 		}
 
 		cmd := data[1]
 
-		for _, varnish := range servers {
+		serverLock.RLock()
+		copiedServers := make(map[string]*VarnishServer)
+		for k, v := range varnishServers {
+			copiedServers[k] = v
+		}
+		serverLock.RUnlock()
+
+		for _, varnish := range copiedServers {
 			select {
 			case varnish.In <- cmd:
-				// All OK
 			default:
 				log.Printf("cmd=\"%s\" status= body= err=\"Queue for %s is full\"", cmd, varnish.Host)
 			}
@@ -122,36 +149,100 @@ func redisListenLoop(queue string, servers []*VarnishServer) (err error) {
 }
 
 func main() {
-	flag.Parse()
+	config := parseFlags()
 
-	viper.SetConfigFile(*config_file)
-	err := viper.ReadInConfig()
-	if err != nil {
-		log.Fatalf("Issue while reading config file: %s\n", err)
-	}
-	viper.Unmarshal(&config)
+	// Log setup based on the command line argument
 	if config.LogFile != "" {
 		f, err := os.OpenFile(config.LogFile, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0660)
 		if err != nil {
 			log.Fatal("error opening log file: ", err)
 		}
-
 		log.SetOutput(f)
 		defer f.Close()
 	}
 
-	for idx, server := range config.VarnishServers {
-		server.Test = fmt.Sprintf("main%d", idx)
-		go server.Start()
-	}
+	configureKubernetesClient(config)
+	redisClient = newRedisClient(config)
 
 	for {
-		err := redisListenLoop("varnish", config.VarnishServers)
+		err := redisListenLoop("varnish")
 		if err != nil {
 			time.Sleep(100 * time.Millisecond)
 			fmt.Printf("type=redis err=\"%s\"\n", err)
 		} else {
 			return
+		}
+	}
+}
+
+func configureKubernetesClient(c Config) {
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		log.Fatalf("Failed to create Kubernetes client config: %v", err)
+	}
+
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		log.Fatalf("Failed to create Kubernetes client: %v", err)
+	}
+
+	informerFactory := informers.NewSharedInformerFactoryWithOptions(clientset, time.Second*30, informers.WithNamespace(c.Namespace))
+	informer := informerFactory.Core().V1().Endpoints().Informer()
+
+	varnishServers = make(map[string]*VarnishServer)
+
+	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    updateVarnishServers,
+		UpdateFunc: func(_, newObj interface{}) { updateVarnishServers(newObj) },
+		DeleteFunc: func(obj interface{}) { removeVarnishServers(obj) },
+	})
+
+	stop := make(chan struct{})
+	defer close(stop)
+	informerFactory.Start(stop)
+	informerFactory.WaitForCacheSync(stop)
+}
+
+func updateVarnishServers(obj interface{}) {
+	endpoints, ok := obj.(*v1.Endpoints)
+	if !ok || endpoints.Name != config.ServiceName {
+		return
+	}
+
+	serverLock.Lock()
+	defer serverLock.Unlock()
+
+	for _, subset := range endpoints.Subsets {
+		for _, address := range subset.Addresses {
+			host := address.IP
+			port := config.Port
+			serverKey := fmt.Sprintf("%s:%d", host, port)
+
+			if _, exists := varnishServers[serverKey]; !exists {
+				server := &VarnishServer{Host: host, Port: uint16(config.Port), In: make(chan string, 1024)}
+				varnishServers[serverKey] = server
+				go server.Start()
+			}
+		}
+	}
+}
+
+func removeVarnishServers(obj interface{}) {
+	endpoints, ok := obj.(*v1.Endpoints)
+	if !ok || endpoints.Name != config.ServiceName {
+		return
+	}
+
+	serverLock.Lock()
+	defer serverLock.Unlock()
+
+	for _, subset := range endpoints.Subsets {
+		for _, address := range subset.Addresses {
+			serverKey := fmt.Sprintf("%s:%d", address.IP, 6082)
+			if server, exists := varnishServers[serverKey]; exists {
+				close(server.In)
+				delete(varnishServers, serverKey)
+			}
 		}
 	}
 }

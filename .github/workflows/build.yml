@@ -1,24 +1,47 @@
-name: Go
+name: Deploy
 
 on:
   push:
-    branches: [ main ]
-    tags: [ v* ]
+    branches:
+      # - master
+      # - stable
+
+permissions:
+  id-token: write
+  contents: read
 
 jobs:
-
-  build-linux:
+  tests:
+    uses: ./.github/workflows/ci.yml
+  staging:
+    needs: [tests]
     runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
     steps:
-    - uses: actions/checkout@v2
-    - name: Set up Go
-      uses: actions/setup-go@v2
+    - uses: actions/checkout@v4
+    - name: Build & Publish [staging]
+      uses: dpgradio/dev-tools/.github/actions/publish-to-ecr@main
       with:
-        go-version: "1.23"
-    - name: Build
-      run: env GOOS=linux GOARCH=amd64 go build -o ./build/ -v ./... 
-    - name: Release
-      uses: softprops/action-gh-release@v1
-      if: startsWith(github.ref, 'refs/tags/v')
+        environment: "staging"
+    - name: Make PR [staging]
+      uses: dpgradio/deployments/.github/actions/pull-request-bump@main
       with:
-        files: build/*
+        app_id: "${{ vars.DEPLOY_APP_ID }}"
+        private_key: "${{ secrets.DEPLOY_APP_SECRET }}"
+
+  production:
+    needs: [tests]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/stable'
+    steps:
+    - uses: actions/checkout@v4
+    - name: Build & Publish [production]
+      uses: dpgradio/dev-tools/.github/actions/publish-to-ecr@main
+      with:
+        environment: "production"
+    - name: Make PR [production]
+      uses: dpgradio/deployments/.github/actions/pull-request-bump@main
+      with:
+        app_id: "${{ vars.DEPLOY_APP_ID }}"
+        private_key: "${{ secrets.DEPLOY_APP_SECRET }}"
+        environment: "production"

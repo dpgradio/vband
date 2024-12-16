@@ -12,10 +12,5 @@ COPY vband.go .
 # GOARCH - architecture
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -a -o vband .
 
-FROM gcr.io/distroless/base-debian12
-
-WORKDIR /
-
-COPY --from=builder /app/vband .
 
 CMD ["./vband"]

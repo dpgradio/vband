@@ -1,7 +1,6 @@
 name: "CI Joe"
 on:
   push:
-  workflow_call:
 jobs:
   test:
     runs-on: ubuntu-latest

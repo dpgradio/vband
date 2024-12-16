@@ -219,9 +219,10 @@ func updateVarnishServers(obj interface{}, config Config) {
 			serverKey := fmt.Sprintf("%s:%d", host, port)
 
 			if _, exists := varnishServers[serverKey]; !exists {
-				server := &VarnishServer{Host: host, Port: uint16(config.Port), In: make(chan string, 1024), Secret: config.VarnishSecret}
+				server := &VarnishServer{Host: host, Port: uint16(port), In: make(chan string, 1024), Secret: config.VarnishSecret}
 				varnishServers[serverKey] = server
 				go server.Start()
+				log.Printf("Added service endpoint:` %s", serverKey)
 			}
 		}
 	}
@@ -238,10 +239,11 @@ func removeVarnishServers(obj interface{}, config Config) {
 
 	for _, subset := range endpoints.Subsets {
 		for _, address := range subset.Addresses {
-			serverKey := fmt.Sprintf("%s:%d", address.IP, 6082)
+			serverKey := fmt.Sprintf("%s:%d", address.IP, config.Port)
 			if server, exists := varnishServers[serverKey]; exists {
 				close(server.In)
 				delete(varnishServers, serverKey)
+				log.Printf("Removed service endpoint:` %s", serverKey)
 			}
 		}
 	}

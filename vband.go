@@ -149,7 +149,7 @@ func redisListenLoop(queue string) error {
 }
 
 func main() {
-	config := parseFlags()
+	config = parseFlags()
 
 	// Log setup based on the command line argument
 	if config.LogFile != "" {

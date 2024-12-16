@@ -35,7 +35,6 @@ type VarnishServer struct {
 }
 
 var (
-	config         Config
 	redisClient    *redis.Client
 	varnishServers map[string]*VarnishServer
 	serverLock     sync.RWMutex
@@ -110,8 +109,8 @@ func (v *VarnishServer) connect() (*gva.Connection, error) {
 	return socket, nil
 }
 
-func newRedisClient(c Config) *redis.Client {
-	opts, err := redis.ParseURL(c.RedisUrl)
+func newRedisClient(connecturi string) *redis.Client {
+	opts, err := redis.ParseURL(connecturi)
 	if err != nil {
 		panic(err)
 	}
@@ -119,8 +118,7 @@ func newRedisClient(c Config) *redis.Client {
 	return redis.NewClient(opts)
 }
 
-func redisListenLoop(queue string) error {
-	rdb := newRedisClient(config)
+func redisListenLoop(queue string, rdb *redis.Client) error {
 	ctx := context.Background()
 
 	for {
@@ -162,10 +160,10 @@ func main() {
 	}
 
 	configureKubernetesClient(config)
-	redisClient = newRedisClient(config)
+	redisClient = newRedisClient(config.RedisUrl)
 
 	for {
-		err := redisListenLoop("varnish")
+		err := redisListenLoop("varnish", redisClient)
 		if err != nil {
 			time.Sleep(100 * time.Millisecond)
 			fmt.Printf("type=redis err=\"%s\"\n", err)
@@ -192,9 +190,9 @@ func configureKubernetesClient(c Config) {
 	varnishServers = make(map[string]*VarnishServer)
 
 	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    updateVarnishServers,
-		UpdateFunc: func(_, newObj interface{}) { updateVarnishServers(newObj) },
-		DeleteFunc: func(obj interface{}) { removeVarnishServers(obj) },
+		AddFunc:    func(obj interface{}) { updateVarnishServers(obj, c) },
+		UpdateFunc: func(_, newObj interface{}) { updateVarnishServers(newObj, c) },
+		DeleteFunc: func(obj interface{}) { removeVarnishServers(obj, c) },
 	})
 
 	stop := make(chan struct{})
@@ -203,7 +201,7 @@ func configureKubernetesClient(c Config) {
 	informerFactory.WaitForCacheSync(stop)
 }
 
-func updateVarnishServers(obj interface{}) {
+func updateVarnishServers(obj interface{}, config Config) {
 	endpoints, ok := obj.(*v1.Endpoints)
 	if !ok || endpoints.Name != config.ServiceName {
 		return
@@ -227,7 +225,7 @@ func updateVarnishServers(obj interface{}) {
 	}
 }
 
-func removeVarnishServers(obj interface{}) {
+func removeVarnishServers(obj interface{}, config Config) {
 	endpoints, ok := obj.(*v1.Endpoints)
 	if !ok || endpoints.Name != config.ServiceName {
 		return

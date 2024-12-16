@@ -1,0 +1,47 @@
+name: Deploy
+
+on:
+  push:
+    branches:
+      - main
+      - stable
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  tests:
+    uses: ./.github/workflows/ci.yml
+  staging:
+    needs: [tests]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+    - uses: actions/checkout@v4
+    - name: Build & Publish [staging]
+      uses: dpgradio/dev-tools/.github/actions/publish-to-ecr@main
+      with:
+        environment: "staging"
+    - name: Make PR [staging]
+      uses: dpgradio/deployments/.github/actions/pull-request-bump@main
+      with:
+        app_id: "${{ vars.DEPLOY_APP_ID }}"
+        private_key: "${{ secrets.DEPLOY_APP_SECRET }}"
+
+  production:
+    needs: [tests]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/stable'
+    steps:
+    - uses: actions/checkout@v4
+    - name: Build & Publish [production]
+      uses: dpgradio/dev-tools/.github/actions/publish-to-ecr@main
+      with:
+        environment: "production"
+    - name: Make PR [production]
+      uses: dpgradio/deployments/.github/actions/pull-request-bump@main
+      with:
+        app_id: "${{ vars.DEPLOY_APP_ID }}"
+        private_key: "${{ secrets.DEPLOY_APP_SECRET }}"
+        environment: "production"

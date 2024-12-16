@@ -1,0 +1,15 @@
+name: "CI Joe"
+on:
+  push:
+  workflow_call:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Go
+      uses: actions/setup-go@v2
+      with:
+        go-version: 1.23
+    - name: Build
+      run: env GOOS=linux GOARCH=amd64 go build -o ./build/ -v ./...

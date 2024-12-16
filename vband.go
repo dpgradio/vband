@@ -19,11 +19,12 @@ import (
 )
 
 type Config struct {
-	LogFile     string
-	RedisUrl    string
-	ServiceName string
-	Namespace   string
-	Port        uint64
+	LogFile       string
+	RedisUrl      string
+	ServiceName   string
+	Namespace     string
+	Port          uint64
+	VarnishSecret string
 }
 
 type VarnishServer struct {
@@ -48,6 +49,7 @@ func parseFlags() Config {
 	flag.StringVar(&config.ServiceName, "varnish_service", "", "Kubernetes Service name for Varnish endpoints")
 	flag.StringVar(&config.Namespace, "namespace", "default", "Kubernetes namespace for Varnish service (default: default)")
 	flag.Uint64Var(&config.Port, "varnish_port", 6082, "Varnish port")
+	flag.StringVar(&config.VarnishSecret, "varnish_secret", "", "Secret to contact the varnish admin port (default: empty)")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
@@ -217,7 +219,7 @@ func updateVarnishServers(obj interface{}, config Config) {
 			serverKey := fmt.Sprintf("%s:%d", host, port)
 
 			if _, exists := varnishServers[serverKey]; !exists {
-				server := &VarnishServer{Host: host, Port: uint16(config.Port), In: make(chan string, 1024)}
+				server := &VarnishServer{Host: host, Port: uint16(config.Port), In: make(chan string, 1024), Secret: config.VarnishSecret}
 				varnishServers[serverKey] = server
 				go server.Start()
 			}

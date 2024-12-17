@@ -164,13 +164,19 @@ func main() {
 
 	varnishServers = make(map[string]*VarnishServer)
 
-	configureKubernetesClient(config)
-	redisClient = newRedisClient(config.RedisUrl)
+	go configureKubernetesClient(config)
 
+	redisClient = newRedisClient(config.RedisUrl)
+	go readRedisQueue(redisClient)
+
+	select {}
+}
+
+func readRedisQueue(redisClient *redis.Client) {
 	for {
 		err := redisListenLoop("varnish", redisClient)
 		if err != nil {
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(1 * time.Second)
 			fmt.Printf("type=redis err=\"%s\"\n", err)
 		} else {
 			return
@@ -202,11 +208,11 @@ func configureKubernetesClient(c Config) {
 	// Start the informer
 	stopCh := make(chan struct{})
 	defer close(stopCh)
-	go endpointsInformer.Run(stopCh)
 
 	log.Println("Started watching endpoints...")
+	endpointsInformer.Run(stopCh)
 
-	select {}
+	log.Println("Done watching endpoints...")
 }
 
 func updateVarnishServers(obj interface{}, config Config) {

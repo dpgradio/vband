@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"slices"
 	"sync"
 	"time"
 
@@ -14,8 +15,8 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
+	cruntimeconfig "sigs.k8s.io/controller-runtime/pkg/client/config"
 )
 
 type Config struct {
@@ -38,7 +39,7 @@ type VarnishServer struct {
 var (
 	redisClient    *redis.Client
 	varnishServers map[string]*VarnishServer
-	serverLock     sync.RWMutex
+	serverLock     sync.Mutex
 )
 
 func parseFlags() Config {
@@ -46,7 +47,7 @@ func parseFlags() Config {
 
 	flag.StringVar(&config.LogFile, "log_file", "", "Path to log file (default: stdout)")
 	flag.StringVar(&config.RedisUrl, "redis_url", "", "URL for Redis server (e.g., redis://localhost:6379/0)")
-	flag.StringVar(&config.ServiceName, "varnish_service", "", "Kubernetes Service name for Varnish endpoints")
+	flag.StringVar(&config.ServiceName, "varnish_service", "varnish", "Kubernetes Service name for Varnish endpoints")
 	flag.StringVar(&config.Namespace, "namespace", "default", "Kubernetes namespace for Varnish service (default: default)")
 	flag.Uint64Var(&config.Port, "varnish_port", 6082, "Varnish port")
 	flag.StringVar(&config.VarnishSecret, "varnish_secret", "", "Secret to contact the varnish admin port (default: empty)")
@@ -61,7 +62,7 @@ func parseFlags() Config {
 	// Validate required flags
 	if config.RedisUrl == "" || config.ServiceName == "" {
 		flag.Usage()
-		log.Fatal("Error: redis_url and varnish_service are required parameters.")
+		log.Fatal("Error: redis_url is a required parameters.")
 	} else {
 		log.Printf("Starting with config:` %o", config)
 	}
@@ -131,12 +132,12 @@ func redisListenLoop(queue string, rdb *redis.Client) error {
 
 		cmd := data[1]
 
-		serverLock.RLock()
+		serverLock.Lock()
 		copiedServers := make(map[string]*VarnishServer)
 		for k, v := range varnishServers {
 			copiedServers[k] = v
 		}
-		serverLock.RUnlock()
+		serverLock.Unlock()
 
 		for _, varnish := range copiedServers {
 			select {
@@ -161,6 +162,8 @@ func main() {
 		defer f.Close()
 	}
 
+	varnishServers = make(map[string]*VarnishServer)
+
 	configureKubernetesClient(config)
 	redisClient = newRedisClient(config.RedisUrl)
 
@@ -176,31 +179,34 @@ func main() {
 }
 
 func configureKubernetesClient(c Config) {
-	config, err := rest.InClusterConfig()
-	if err != nil {
-		log.Fatalf("Failed to create Kubernetes client config: %v", err)
-	}
+	clientset := kubernetes.NewForConfigOrDie(cruntimeconfig.GetConfigOrDie())
 
-	clientset, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		log.Fatalf("Failed to create Kubernetes client: %v", err)
-	}
+	factory := informers.NewSharedInformerFactoryWithOptions(clientset, time.Minute, informers.WithNamespace(c.Namespace))
+	endpointsInformer := factory.Core().V1().Endpoints().Informer()
 
-	informerFactory := informers.NewSharedInformerFactoryWithOptions(clientset, time.Second*30, informers.WithNamespace(c.Namespace))
-	informer := informerFactory.Core().V1().Endpoints().Informer()
-
-	varnishServers = make(map[string]*VarnishServer)
-
-	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    func(obj interface{}) { updateVarnishServers(obj, c) },
-		UpdateFunc: func(_, newObj interface{}) { updateVarnishServers(newObj, c) },
-		DeleteFunc: func(obj interface{}) { removeVarnishServers(obj, c) },
+	endpointsInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			log.Println("Calling AddFunc")
+			updateVarnishServers(obj, c)
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			log.Println("Calling UpdateFunc")
+			updateVarnishServers(newObj, c)
+		},
+		DeleteFunc: func(obj interface{}) {
+			log.Println("Calling DeleteFunc")
+			removeVarnishServers(obj, c)
+		},
 	})
 
-	stop := make(chan struct{})
-	defer close(stop)
-	informerFactory.Start(stop)
-	informerFactory.WaitForCacheSync(stop)
+	// Start the informer
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+	go endpointsInformer.Run(stopCh)
+
+	log.Println("Started watching endpoints...")
+
+	select {}
 }
 
 func updateVarnishServers(obj interface{}, config Config) {
@@ -212,20 +218,32 @@ func updateVarnishServers(obj interface{}, config Config) {
 	serverLock.Lock()
 	defer serverLock.Unlock()
 
+	// fill array with all keys
+	newKeys := []string{}
 	for _, subset := range endpoints.Subsets {
 		for _, address := range subset.Addresses {
-			host := address.IP
-			port := config.Port
-			serverKey := fmt.Sprintf("%s:%d", host, port)
-
-			if _, exists := varnishServers[serverKey]; !exists {
-				server := &VarnishServer{Host: host, Port: uint16(port), In: make(chan string, 1024), Secret: config.VarnishSecret}
-				varnishServers[serverKey] = server
-				go server.Start()
-				log.Printf("Added service endpoint:` %s", serverKey)
-			}
+			newKeys = append(newKeys, address.IP)
 		}
 	}
+
+	for _, serverKey := range newKeys {
+		if _, exists := varnishServers[serverKey]; !exists { // not in the slice, add new one
+			server := &VarnishServer{Host: serverKey, Port: uint16(config.Port), In: make(chan string, 1024), Secret: config.VarnishSecret}
+			varnishServers[serverKey] = server
+			go server.Start()
+			log.Printf("Added new endpoint:` %s", serverKey)
+		}
+	}
+
+	for serverKey, varnishServer := range varnishServers {
+		if !slices.Contains(newKeys, serverKey) { // serverkey isn't in the new array, remove the endpoint
+			close(varnishServer.In)
+			delete(varnishServers, serverKey)
+			log.Printf("Removed endpoint:` %s", serverKey)
+		}
+	}
+
+	log.Printf("Updated endpoints: %v", varnishServers)
 }
 
 func removeVarnishServers(obj interface{}, config Config) {
@@ -237,14 +255,11 @@ func removeVarnishServers(obj interface{}, config Config) {
 	serverLock.Lock()
 	defer serverLock.Unlock()
 
-	for _, subset := range endpoints.Subsets {
-		for _, address := range subset.Addresses {
-			serverKey := fmt.Sprintf("%s:%d", address.IP, config.Port)
-			if server, exists := varnishServers[serverKey]; exists {
-				close(server.In)
-				delete(varnishServers, serverKey)
-				log.Printf("Removed service endpoint:` %s", serverKey)
-			}
-		}
+	for serverKey, varnishServer := range varnishServers {
+		close(varnishServer.In)
+		delete(varnishServers, serverKey)
+		log.Printf("Removed endpoint:` %s", serverKey)
 	}
+
+	log.Printf("Wiped endpoints: %v", varnishServers)
 }

@@ -65,7 +65,7 @@ func parseFlags() Config {
 	// Validate required flags
 	if config.RedisUrl == "" {
 		flag.Usage()
-		fmt.Println("Error: redis_url is a required parameter")
+		fmt.Fprintln(os.Stderr, "Error: redis_url is a required parameter")
 		os.Exit(1)
 	}
 

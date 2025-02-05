@@ -4,7 +4,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log"
 	"os"
 	"slices"
 	"sync"
@@ -12,6 +11,7 @@ import (
 
 	"github.com/kreuzwerker/gva"
 	"github.com/redis/go-redis/v9"
+	"go.uber.org/zap"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
@@ -21,6 +21,7 @@ import (
 
 type Config struct {
 	LogFile       string
+	LogLevel      string
 	RedisUrl      string
 	ServiceName   string
 	Namespace     string
@@ -40,12 +41,14 @@ var (
 	redisClient    *redis.Client
 	varnishServers map[string]*VarnishServer
 	serverLock     sync.Mutex
+	log            *zap.SugaredLogger
 )
 
 func parseFlags() Config {
 	var config Config
 
 	flag.StringVar(&config.LogFile, "log_file", "", "Path to log file (default: stdout)")
+	flag.StringVar(&config.LogLevel, "log_level", "info", "loglevel (default: info)")
 	flag.StringVar(&config.RedisUrl, "redis_url", "", "URL for Redis server (e.g., redis://localhost:6379/0)")
 	flag.StringVar(&config.ServiceName, "varnish_service", "varnish", "Kubernetes Service name for Varnish endpoints")
 	flag.StringVar(&config.Namespace, "namespace", "default", "Kubernetes namespace for Varnish service (default: default)")
@@ -60,22 +63,22 @@ func parseFlags() Config {
 	flag.Parse()
 
 	// Validate required flags
-	if config.RedisUrl == "" || config.ServiceName == "" {
+	if config.RedisUrl == "" {
 		flag.Usage()
-		log.Fatal("Error: redis_url is a required parameters.")
-	} else {
-		log.Printf("Starting with config:` %o", config)
+		fmt.Println("Error: redis_url is a required parameter")
+		os.Exit(1)
 	}
 
 	return config
 }
 
 func (v *VarnishServer) Start() {
+	log.Infow("Starting varnish endpoint", "host", v.Host)
 	v.In = make(chan string, 1024)
 	for {
 		err := v.StartOne()
 		if err != nil {
-			fmt.Printf("type=varnish host=%s err=\"%s\"\n", v.Host, err)
+			log.Warnw("StartOne failed", "host", v.Host, "err", err)
 			time.Sleep(100 * time.Millisecond)
 		} else {
 			return
@@ -94,12 +97,12 @@ func (v *VarnishServer) StartOne() error {
 		cmd := <-v.In
 		response, err := v.socket.Cmd(cmd)
 		if err != nil {
-			log.Printf("cmd=\"%s\" status= err=%v\n", cmd, err)
+			log.Warnw("Sending command failed, re-queueing", "cmd", cmd, "err", err)
 			v.In <- cmd
 			return err
 		}
 
-		log.Printf("cmd=\"%s\" status=%d body=\"%s\" err=\n", cmd, response.Status, response.Body)
+		log.Debugw("Command sent", "cmd", cmd, "status", response.Status, "body", response.Body)
 	}
 }
 
@@ -115,7 +118,7 @@ func (v *VarnishServer) connect() (*gva.Connection, error) {
 func newRedisClient(connecturi string) *redis.Client {
 	opts, err := redis.ParseURL(connecturi)
 	if err != nil {
-		panic(err)
+		log.Fatalw("Error parsing Redis URI", "uri", connecturi, "err", err)
 	}
 
 	return redis.NewClient(opts)
@@ -143,7 +146,7 @@ func redisListenLoop(queue string, rdb *redis.Client) error {
 			select {
 			case varnish.In <- cmd:
 			default:
-				log.Printf("cmd=\"%s\" status= body= err=\"Queue for %s is full\"", cmd, varnish.Host)
+				log.Warnw("Queue is full when sending command", "cmd", cmd, "host", varnish.Host)
 			}
 		}
 	}
@@ -152,15 +155,39 @@ func redisListenLoop(queue string, rdb *redis.Client) error {
 func main() {
 	config := parseFlags()
 
-	// Log setup based on the command line argument
-	if config.LogFile != "" {
-		f, err := os.OpenFile(config.LogFile, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0660)
-		if err != nil {
-			log.Fatal("error opening log file: ", err)
-		}
-		log.SetOutput(f)
-		defer f.Close()
+	// Logging setup - structured logging is hard, but nice
+	level := zap.NewAtomicLevel()
+	if err := level.UnmarshalText([]byte(config.LogLevel)); err != nil {
+		fmt.Fprintf(os.Stderr, "invalid log level '%s', defaulting to info\n", config.LogLevel)
+		level = zap.NewAtomicLevelAt(zap.InfoLevel)
 	}
+
+	cfg := zap.Config{
+		Level:             level,
+		Development:       false,
+		Encoding:          "json", // You can use "console" for human-readable output.
+		EncoderConfig:     zap.NewProductionEncoderConfig(),
+		OutputPaths:       []string{},
+		ErrorOutputPaths:  []string{"stderr"},
+		DisableCaller:     false,
+		DisableStacktrace: false,
+	}
+
+	// Decide the output based on the logfile flag.
+	if config.LogFile == "" || config.LogFile == "stdout" || config.LogFile == "-" {
+		cfg.OutputPaths = []string{"stdout"}
+	} else {
+		cfg.OutputPaths = []string{config.LogFile}
+	}
+
+	logger, err := cfg.Build()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to build logger: %v\n", err)
+		os.Exit(1)
+	}
+	defer logger.Sync()
+	log = logger.Sugar()
+	log.Infow("Starting up", "config", config)
 
 	varnishServers = make(map[string]*VarnishServer)
 
@@ -177,7 +204,7 @@ func readRedisQueue(redisClient *redis.Client) {
 		err := redisListenLoop("varnish", redisClient)
 		if err != nil {
 			time.Sleep(1 * time.Second)
-			fmt.Printf("type=redis err=\"%s\"\n", err)
+			log.Warn("Failed to read from redis queue", "err", err)
 		} else {
 			return
 		}
@@ -192,15 +219,15 @@ func configureKubernetesClient(c Config) {
 
 	endpointsInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			log.Println("Calling AddFunc")
+			log.Debugw("Calling AddFunc", "obj", obj)
 			updateVarnishServers(obj, c)
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
-			log.Println("Calling UpdateFunc")
+			log.Debugw("Calling UpdateFunc", "oldObj", oldObj, "newObj", newObj)
 			updateVarnishServers(newObj, c)
 		},
 		DeleteFunc: func(obj interface{}) {
-			log.Println("Calling DeleteFunc")
+			log.Debugw("Calling DeleteFunc", "obj", obj)
 			removeVarnishServers(obj, c)
 		},
 	})
@@ -209,10 +236,10 @@ func configureKubernetesClient(c Config) {
 	stopCh := make(chan struct{})
 	defer close(stopCh)
 
-	log.Println("Started watching endpoints...")
+	log.Info("Started watching endpoints...")
 	endpointsInformer.Run(stopCh)
 
-	log.Println("Done watching endpoints...")
+	log.Info("Done watching endpoints...")
 }
 
 func updateVarnishServers(obj interface{}, config Config) {
@@ -237,7 +264,7 @@ func updateVarnishServers(obj interface{}, config Config) {
 			server := &VarnishServer{Host: serverKey, Port: uint16(config.Port), In: make(chan string, 1024), Secret: config.VarnishSecret}
 			varnishServers[serverKey] = server
 			go server.Start()
-			log.Printf("Added new endpoint:` %s", serverKey)
+			log.Debugw("Added new endpoint", "endpoint", serverKey)
 		}
 	}
 
@@ -245,11 +272,11 @@ func updateVarnishServers(obj interface{}, config Config) {
 		if !slices.Contains(newKeys, serverKey) { // serverkey isn't in the new array, remove the endpoint
 			close(varnishServer.In)
 			delete(varnishServers, serverKey)
-			log.Printf("Removed endpoint:` %s", serverKey)
+			log.Debugw("Removed endpoint", "endpoint", serverKey)
 		}
 	}
 
-	log.Printf("Updated endpoints: %v", varnishServers)
+	log.Infow("Updated endpoints", "endpoints", varnishServers)
 }
 
 func removeVarnishServers(obj interface{}, config Config) {
@@ -264,8 +291,8 @@ func removeVarnishServers(obj interface{}, config Config) {
 	for serverKey, varnishServer := range varnishServers {
 		close(varnishServer.In)
 		delete(varnishServers, serverKey)
-		log.Printf("Removed endpoint:` %s", serverKey)
+		log.Debugw("Removed endpoint", "endpoint", serverKey)
 	}
 
-	log.Printf("Wiped endpoints: %v", varnishServers)
+	log.Info("Wiped endpoints")
 }

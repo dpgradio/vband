@@ -35,6 +35,7 @@ type VarnishServer struct {
 	Secret string
 	In     chan string
 	socket *gva.Connection
+	stop   chan struct{} // shutdown channel
 }
 
 var (
@@ -75,6 +76,7 @@ func parseFlags() Config {
 func (v *VarnishServer) Start() {
 	log.Infow("Starting varnish endpoint", "host", v.Host)
 	v.In = make(chan string, 1024)
+	v.stop = make(chan struct{})
 	for {
 		err := v.StartOne()
 		if err != nil {
@@ -94,15 +96,29 @@ func (v *VarnishServer) StartOne() error {
 	}
 
 	for {
-		cmd := <-v.In
-		response, err := v.socket.Cmd(cmd)
-		if err != nil {
-			log.Warnw("Sending command failed, re-queueing", "cmd", cmd, "err", err)
-			v.In <- cmd
-			return err
+		select {
+		case cmd, ok := <-v.In:
+			if !ok {
+				return nil
+			}
+			response, err := v.socket.Cmd(cmd)
+			if err != nil {
+				log.Warnw("Sending command failed", "cmd", cmd, "err", err)
+				select {
+				case <-v.stop:
+					log.Warnln("Varnish is shutting down, not requeue-ing, exiting loop")
+					return err
+				default:
+					log.Warnln("Requeueing command", "cmd", cmd)
+					v.In <- cmd
+				}
+				return err
+			}
+			log.Debugw("Command sent", "cmd", cmd, "status", response.Status, "body", response.Body)
+		case <-v.stop:
+			log.Warnln("Varnish is shutting down, exiting loop")
+			return nil
 		}
-
-		log.Debugw("Command sent", "cmd", cmd, "status", response.Status, "body", response.Body)
 	}
 }
 
@@ -270,7 +286,7 @@ func updateVarnishServers(obj interface{}, config Config) {
 
 	for serverKey, varnishServer := range varnishServers {
 		if !slices.Contains(newKeys, serverKey) { // serverkey isn't in the new array, remove the endpoint
-			close(varnishServer.In)
+			close(varnishServer.stop)
 			delete(varnishServers, serverKey)
 			log.Debugw("Removed endpoint", "endpoint", serverKey)
 		}
@@ -289,7 +305,7 @@ func removeVarnishServers(obj interface{}, config Config) {
 	defer serverLock.Unlock()
 
 	for serverKey, varnishServer := range varnishServers {
-		close(varnishServer.In)
+		close(varnishServer.stop)
 		delete(varnishServers, serverKey)
 		log.Debugw("Removed endpoint", "endpoint", serverKey)
 	}

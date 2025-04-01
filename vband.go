@@ -292,7 +292,11 @@ func updateVarnishServers(obj interface{}, config Config) {
 		}
 	}
 
-	log.Infow("Updated endpoints", "endpoints", varnishServers)
+	var hostnames []string
+	for serverKey := range varnishServers {
+		hostnames = append(hostnames, serverKey)
+	}
+	log.Infow("Updated endpoints", "endpoints", hostnames)
 }
 
 func removeVarnishServers(obj interface{}, config Config) {

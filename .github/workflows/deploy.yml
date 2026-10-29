@@ -20,11 +20,11 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: Build & Publish [staging]
-      uses: dpgradio/dev-tools/.github/actions/publish-to-ecr@main
+      uses: dpgradio/publish-to-ecr@86170e2988cbf00d05565e371700e0811ae3057e # v1.0.1
       with:
         environment: "staging"
     - name: Make PR [staging]
-      uses: dpgradio/deployments/.github/actions/pull-request-bump@main
+      uses: dpgradio/pull-request-bump@002253318ff8a6164ae288a42b3ba12c4e6f1f5f # v1.0.1
       with:
         app_id: "${{ vars.DEPLOY_APP_ID }}"
         private_key: "${{ secrets.DEPLOY_APP_SECRET }}"
@@ -36,11 +36,11 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: Build & Publish [production]
-      uses: dpgradio/dev-tools/.github/actions/publish-to-ecr@main
+      uses: dpgradio/publish-to-ecr@86170e2988cbf00d05565e371700e0811ae3057e # v1.0.1
       with:
         environment: "production"
     - name: Make PR [production]
-      uses: dpgradio/deployments/.github/actions/pull-request-bump@main
+      uses: dpgradio/pull-request-bump@002253318ff8a6164ae288a42b3ba12c4e6f1f5f # v1.0.1
       with:
         app_id: "${{ vars.DEPLOY_APP_ID }}"
         private_key: "${{ secrets.DEPLOY_APP_SECRET }}"

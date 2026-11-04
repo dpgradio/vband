@@ -24,7 +24,7 @@ jobs:
       with:
         environment: "staging"
     - name: Make PR [staging]
-      uses: dpgradio/pull-request-bump@002253318ff8a6164ae288a42b3ba12c4e6f1f5f # v1.0.1
+      uses: dpgradio/pull-request-bump@e603d52965ef68407e063852f04aaa97e9d8ac86 # v1.0.2
       with:
         app_id: "${{ vars.DEPLOY_APP_ID }}"
         private_key: "${{ secrets.DEPLOY_APP_SECRET }}"
@@ -40,7 +40,7 @@ jobs:
       with:
         environment: "production"
     - name: Make PR [production]
-      uses: dpgradio/pull-request-bump@002253318ff8a6164ae288a42b3ba12c4e6f1f5f # v1.0.1
+      uses: dpgradio/pull-request-bump@e603d52965ef68407e063852f04aaa97e9d8ac86 # v1.0.2
       with:
         app_id: "${{ vars.DEPLOY_APP_ID }}"
         private_key: "${{ secrets.DEPLOY_APP_SECRET }}"
